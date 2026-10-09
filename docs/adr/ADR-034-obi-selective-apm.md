@@ -2,6 +2,52 @@
 
 Status: Accepted — 原始决策 2026-09-14；以下早期设计记录中的开关和 Kubernetes 限制已由 2026-09-20 修订替代，当前行为以 [PRD-008](../requirements/PRD-008-obi-selective-apm.md) 为准。
 
+## Pod 注解指标互通（2026-10-09）
+
+默认的 Kubernetes Metrics Scraper 使用已随 Edge 分发的官方 OpenTelemetry
+Collector Prometheus Receiver 采集 `prometheus.io/scrape` Pod；端口、路径和协议
+沿用 `prometheus.io/port`、`prometheus.io/path`、`prometheus.io/scheme` 约定。
+Kubernetes 服务发现、Watch、指标解析、目标去重与重标签由官方组件处理。
+Collector 复用现有 subprocess 监督、配置校验、凭据轮换及 remote_write 出口。
+Scraper 保持单副本和 Recreate 更新；扩容前必须增加目标分片，不能复制相同配置。
+KSM 保持原有采集路径；旧 controller 兼容模式继续使用已有抓取实现。
+
+新安装默认开启 Pod 注解发现，显式设置的旧版或新版 `appDiscovery.enabled=false`
+仍有效。Pod 注解是每个应用的采集声明，采集范围与 Auto APM 共用同一组
+Namespace/工作负载规则；未选择任何规则时不采集应用指标。Namespace 规则
+自动包含该 Namespace 的新 Pod，工作负载规则复用库存的真实 owner 链解析
+Pod UID，不使用 Pod 名称前缀猜测归属。KSM 不受应用范围限制。
+Manager 通过现有 telemetry-config 下发范围，Controller 同步到现有 Secret，
+Scraper 在抓取前按 Namespace/Pod UID 过滤。Controller 默认每分钟同步一次，
+随后还需等待 Kubernetes Secret 投影与 Scraper 的 10 秒配置检查；新增工作负载
+Pod 还需先完成库存同步。取消选择不是瞬时生效，历史指标不会删除。
+缺少范围的旧 Manager/Controller 不会使新版 Scraper 回退为全量采集；应先升级
+Manager 和 Controller，再升级 Scraper。已有配置读取失败时沿用最近有效配置。
+Scraper 只增加 Pod 的 list/watch 权限，范围通过卷投影读取，不增加 Secret API 读取权限。
+
+应用指标保留业务标签。Prometheus 的 `honor_labels=false` 将与目标身份冲突的
+应用标签保存在 `exported_*` 标签中；平台控制 `cluster_id`、`ongrid_source`，
+不再统一删除业务 `id`、`instance`、`url` 等维度。应用抓取来源统一为
+`ongrid_source="k8s:app-metrics"`。目标状态使用官方 `up` 指标；有 KSM 时
+Scraper readiness 继续反映核心采集状态，只有 Pod 发现时反映 Collector 进程健康。
+readiness 不代表所有应用端点或 remote_write 出口都成功。
+Receiver 将应用的 `target_info` 转为资源属性，remote_write 保持默认的
+`target_info` 导出，以保留服务、版本等元数据及 `job`/`instance` 关联。
+
+APM 请求、错误率、延迟和运行时查询排除此原始抓取来源，保留现有 APM 统计口径。
+原始指标仍可独立查询。此来源选择是 Ongrid 的产品策略，不是官方通用语义去重：
+同名指标的请求范围、单位、桶边界或运行时含义可能不同，不能自动相加。
+OBI 保持 `exclude_otel_instrumented_services=true`；其 OTel 导出检测不等同于
+识别任意 Prometheus `/metrics` 与 OBI 的指标重叠。
+
+验证示例位于 [examples/prometheus-go](../../examples/prometheus-go/README.md)。
+设置 `ONGRID_TEST_OTELCOL_BINARY` 为随 Edge 分发的 Collector 路径后，运行
+`go test -race ./cmd/ongrid-edge -run TestPodMetricsPreservesTargetInfo`，
+可验证真实抓取和 remote_write 转发后的元数据与关联标签。
+官方参考：[Prometheus Receiver](https://github.com/open-telemetry/opentelemetry-collector-contrib/tree/main/receiver/prometheusreceiver)、
+[Scraper 分片](https://opentelemetry.io/docs/collector/scaling/#scaling-the-scrapers)、
+[OBI 已插桩服务排除](https://opentelemetry.io/docs/zero-code/obi/configure/service-discovery/#exclude-otel-instrumented-services)。
+
 ## 当前修订（2026-09-20）
 
 发现常开，空目标只发现。取消全局设置依赖，旧 false 值不阻止发现；停止采集通过清空目标或规则完成。普通设备使用进程路径与端口，日志路径随目标交给现有 logs 插件；Kubernetes 按集群 Namespace 和工作负载选择，范围内全部容器的链路与日志使用同一规则；旧容器限制在共享配置解析时清除。服务身份和环境沿用 PRD 的继承规则。已有设备日志配置保留，运行时投影服务文件源，避免保存两份日志配置。
